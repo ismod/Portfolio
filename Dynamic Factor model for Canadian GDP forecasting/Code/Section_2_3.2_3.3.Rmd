@@ -1,0 +1,1312 @@
+---
+title: "Nowcasting simulation"
+output: word_document
+---
+
+
+```{r}
+#### Loading the data 
+STATCAN_data<-read.table("statcan.txt") # make sure statcan.txt is in your working directory
+m <- ncol(STATCAN_data)
+STATCAN_data <- STATCAN_data[,2:m] #The first column contains the dates, so it's not important 
+STATCAN_names <-c("Y1_HOURS","X1_HOURSMAN","X2_HOURSWSRT","Y2_CPI","Y3_EMP","Y4_USCAN","Y5_ROWCAN","Y6_CANUS","Y7_CANROW","Y8_RAIL","Y9_DOM","Y10_TRAN","Y11_INT","Y12_MSM","Y13_MRTS","Y14_IMP","Y15_EXP","Y16_GDP")
+colnames(STATCAN_data) <- STATCAN_names
+str(STATCAN_data) # check the type of object - at this moment this is 'data.frame', we need 'Time Series'
+```
+
+```{r}
+par(mfrow = c(2,2))
+plot.ts(STATCAN_data$Y3_EMP)
+plot.ts(STATCAN_data$Y9_DOM)
+plot.ts(STATCAN_data$Y10_TRAN)
+plot.ts(STATCAN_data$Y11_INT)
+```
+
+
+```{r}
+#### Removing the time series with strong seasonality
+toremove=c(which(colnames(STATCAN_data) == "Y3_EMP"),which(colnames(STATCAN_data) == "Y9_DOM"),which(colnames(STATCAN_data) == "Y10_TRAN"),which(colnames(STATCAN_data) == "Y11_INT"))
+STATCAN_data <- subset(STATCAN_data, select=-toremove)
+```
+
+
+```{r}
+#Blocks argument for the ML approach in the nowcasting package
+Blocks <- matrix(1,ncol(STATCAN_data), 1)
+```
+
+
+```{r}
+#### Converting the dataframe object to a time series object (monthly data)
+STATCAN_ts<-ts(STATCAN_data,frequency=12, class = c("ts"))
+```
+
+
+```{r}
+#### Making the time series stationary
+
+
+#Now the time series will be transformed to make them stationary. To achieve that, I'll difference them once (i.e Yt will be replaced by Yt-Yt-1).
+#For this I use the Bpanel(base,trans,....) function (in the nowcasting package). 
+#It's first argument "base" contains the time series to transform. 
+#The second argument indicates "trans" is a vector whose ith element indicates the transformation to do on the ith time series of "base". if this ith element is 2, then the ith time series will be differenced once.
+
+library(nowcasting)
+Transformations <- as.integer(rep(1,ncol(STATCAN_ts))) #vector of transformations for the Bpanel() function. the inner function returns something of type "num" and as.integer() converts it to something of type "int".
+STATCAN_ts.stat <- Bpanel(base = STATCAN_ts, trans = Transformations) #There are 12 NAs at the end of each time series. Those are used in the nowcasting function for the out of sample forecasts. The function will not work without them.
+```
+
+
+
+```{r}
+#Removing the means for each time series
+seriesmeans <- as.vector(colMeans(STATCAN_ts.stat[1:181,]))
+meansmatrix <- matrix(rep(seriesmeans,nrow(STATCAN_ts.stat)),nrow = nrow(STATCAN_ts.stat),byrow = TRUE)
+STATCAN_ts.stat <- STATCAN_ts.stat - meansmatrix
+```
+
+
+
+
+
+```{r}
+par(mfrow = c(2,2))
+plot.ts(STATCAN_ts.stat[,3],ylab = colnames(STATCAN_ts.stat)[3] )
+lines(rep(0,nrow(STATCAN_ts.stat)),col = "red")
+plot.ts(STATCAN_ts.stat[,6],ylab = colnames(STATCAN_ts.stat)[6] )
+lines(rep(0,nrow(STATCAN_ts.stat)),col = "red")
+plot.ts(STATCAN_ts.stat[,10],ylab = colnames(STATCAN_ts.stat)[10] )
+lines(rep(0,nrow(STATCAN_ts.stat)),col = "red")
+plot.ts(STATCAN_ts.stat[,14],ylab = colnames(STATCAN_ts.stat)[14] )
+lines(rep(0,nrow(STATCAN_ts.stat)),col = "red")
+```
+
+```{r}
+colnames(STATCAN_ts.stat)
+```
+
+
+
+```{r}
+#### Storing the dependent variable (GDP) and the independent variables
+
+
+gdp_position_CANGDP <- which(colnames(STATCAN_ts.stat) == "Y16_GDP") # which column contains GDP;
+
+x_CANGDP <- STATCAN_ts.stat[,-gdp_position_CANGDP]
+y_CANGDP <- STATCAN_ts.stat[,gdp_position_CANGDP]
+
+data_CANGDP <- cbind(y_CANGDP, x_CANGDP) #I put the GDP as the first column. This formating is necessary for the nowcasting function to work. 
+
+#Removing the NAs for the PCA regression part
+x_CANGDP <-na.omit(x_CANGDP, na.action = "exclude" ) 
+y_CANGDP <- na.omit(y_CANGDP, na.action = "exclude")
+
+
+#data_CANGDP
+```
+
+
+```{r}
+## libraries for data visualization
+library(ggplot2)
+library(gridExtra)
+
+library(vars) #package for VAR
+```
+
+
+```{r}
+#Installing the dynfactoR package
+devtools::install_github("rbagd/dynfactoR")
+```
+
+
+
+
+I) Fitting a VAR to the data
+
+```{r}
+#Selecting the optimal number of lags for the VAR
+VARselect(x_CANGDP)
+```
+
+Most of the information criteria select p = 1 as the optimal number of lags, so I'll fit the VAR with p =1
+
+```{r}
+var_x_CANGDP <- VAR(x_CANGDP,p=1,type="none")
+summary(var_x_CANGDP)
+```
+
+
+
+
+```{r}
+Acoef(var_x_CANGDP)
+```
+
+
+```{r}
+#Acoef(var_x_CANGDP)[[1]]
+#summary(var_x_CANGDP)$covres
+par(mfrow = c(2,2))
+m = summary(var_x_CANGDP)
+#quantile(x = (m$varresult$Y1_HOURS$residuals/x_CANGDP[,"Y1_HOURS"]), probs = c(0.25,0.75))
+#boxplot(m$varresult$Y1_HOURS$residuals/x_CANGDP[,"Y1_HOURS"])
+#hist(m$varresult$Y1_HOURS$residuals/x_CANGDP[,"Y1_HOURS"])
+#residual_means <- c(mean(m$varresult$Y1_HOURS$residuals),mean(m$varresult$X1_HOURSMAN$residuals),mean(m$varresult$X2_HOURSWSRT$residuals),mean(m$varresult$Y2_CPI$residuals),mean(m$varresult$Y4_USCAN$residuals),mean(m$varresult$Y5_ROWCAN$residuals),mean(m$varresult$Y6_CANUS$residuals),mean(m$varresult$Y7_CANROW$residuals),mean(m$varresult$Y8_RAIL$residuals),mean(m$varresult$Y12_MSM$residuals),mean(m$varresult$Y13_MRTS$residuals),mean(m$varresult$Y14_IMP$residuals),mean(m$varresult$Y15_EXP$residuals))
+#lines(x_CANGDP[,"Y1_HOURS"], col = "red")
+#barplot(residual_means)
+#max(abs(residual_means))
+#residual_means
+#plot.ts(m$varresult$Y5_ROWCAN$residuals)
+#lines(rep(0,length(m$varresult$Y5_ROWCAN$residuals)),col = "red")
+residualseries <- list(m$varresult$Y1_HOURS$residuals,m$varresult$X1_HOURSMAN$residuals,m$varresult$X2_HOURSWSRT$residuals,m$varresult$Y2_CPI$residuals,m$varresult$Y4_USCAN$residuals,m$varresult$Y5_ROWCAN$residuals,m$varresult$Y6_CANUS$residuals,m$varresult$Y7_CANROW$residuals,m$varresult$Y8_RAIL$residuals,m$varresult$Y12_MSM$residuals,m$varresult$Y13_MRTS$residuals,m$varresult$Y14_IMP$residuals,m$varresult$Y15_EXP$residuals)
+
+for (i in 1:13)
+{
+   plot.ts(residualseries[[i]], ylab = paste("Residuals",colnames(x_CANGDP)[i]))
+   lines(rep(mean(residualseries[[i]]),length(residualseries[[i]])),col = "red")
+}
+```
+
+
+
+
+Residual check:
+
+Independence of innovations and the features
+
+```{r}
+#for(i in 1:ncol(resid(var_x_CANGDP))){
+   
+   #for(j in 1:ncol(resid(var_x_CANGDP))){
+      #acf(cbind(resid(var_x_CANGDP)[,i],x_CANGDP[2:181,j]))
+   #}
+#}
+
+par(mfrow = c(3,3))
+
+for(i in 1:3){
+   
+   for(j in 1:3){
+      ccf(resid(var_x_CANGDP)[,i],x_CANGDP[2:181,j],xlim = c(0,20),ylab = "CCF",sub = paste("Res.",colnames(x_CANGDP)[i]," & ",colnames(x_CANGDP)[j], sep = ""),main = "")
+   }
+}
+
+
+```
+
+```{r}
+resid(var_x_CANGDP)[,1]
+as.matrix(x_CANGDP[,1])
+
+```
+
+
+```{r}
+#resid(var_x_CANGDP)
+acf(resid(var_x_CANGDP)[,1:3],24)
+#acf(resid(var_x_CANGDP),24)
+
+var_names <- names(resid(var_x_CANGDP)[1,])
+par(mfrow = c(2,3))
+for(i in 1:ncol(resid(var_x_CANGDP))){
+   qqnorm(resid(var_x_CANGDP)[,i],main=var_names[i])
+   #qqt()
+   #qqt(resid(var_x_CANGDP)[,i])
+   qqline(resid(var_x_CANGDP)[,i], col = "steelblue", lwd = 2)
+   print(var_names[i])
+   print(shapiro.test(resid(var_x_CANGDP)[,i])$p.value)
+   
+}
+```
+
+Looking at the normal qq-plots and the p values of the Shapiro-Wilk test for Normality, The residuals for the variables X1_HOURSMAN, Y4_USCAN, Y6_CANUS, Y7_CANROW, Y12_MSM. Do not seem to be normal. Let's look at their histograms to find distributions that coud be a better fit for those variables.
+
+
+```{r}
+library(QRM)
+
+Stud_x_CANGDP <- cbind(x_CANGDP[,"X1_HOURSMAN"],x_CANGDP[,"Y4_USCAN"],x_CANGDP[,"Y6_CANUS"],x_CANGDP[,"Y7_CANROW"],x_CANGDP[,"Y12_MSM"])
+var_names2<-c("X1_HOURSMAN","Y4_USCAN","Y6_CANUS","Y7_CANROW","Y12_MSM")
+#Stud_x_CANGDP
+nu_list <- rep(0,5)
+for(i in 1:5){
+   #nu_list[i]<- fit.st(Stud_x_CANGDP[,i])$par.ests["nu"]
+   hist(Stud_x_CANGDP[,i],main = var_names2[i])
+}
+#nu_list
+
+#library(Dowd)
+#for(i in 1:5){
+   #TQQPlot(Ra=as.vector(Stud_x_CANGDP[,i]),df = nu_list[i])
+#}
+
+```
+
+For the variables, X1_HOURSMAN, Y7_CANROW and Y12_MSM, the distribution seem to be left skewed.
+For the variable Y4_USCAN, the distribution seem to be right skewed.
+For the variable Y6_CANUS the distribution is centered, but seem to have heavier tails than a normal distribution.
+
+
+Regressing the GDP against the features
+
+```{r}
+CANGDP_feat_reg<-lm(y_CANGDP~x_CANGDP)
+CANGDP_feat_reg_coeff<- CANGDP_feat_reg$coefficients
+qqnorm(CANGDP_feat_reg$residuals)
+qqline(CANGDP_feat_reg$residuals, col = "steelblue", lwd = 2)
+print("p-value of Shapiro Wilk test")
+print(shapiro.test(CANGDP_feat_reg$residuals)$p.value)
+print("standard deviation of the residuals")
+sd(CANGDP_feat_reg$residuals)
+```
+
+From the normal qq plot of the residuals and the result of the Shapiro Wilk test for normality, we can assume that the residuals follow a normal distribution.
+
+
+
+Number of lags to predict Y
+
+```{r}
+
+# Selecting optimal number of lags for forecasting (Direct approach)
+samplesize <- nrow(as.matrix( y_CANGDP))
+reg_1lag <- lm(y_CANGDP[2:samplesize]~x_CANGDP[1:(samplesize-1),]+0)
+reg_2lag <- lm(y_CANGDP[3:samplesize]~cbind(x_CANGDP[2:(samplesize-1),],x_CANGDP[1:(samplesize-2),])+0)
+reg_3lag <- lm(y_CANGDP[4:samplesize]~cbind(x_CANGDP[3:(samplesize-1),],x_CANGDP[2:(samplesize-2),],x_CANGDP[1:(samplesize-3),])+0)
+reg_4lag <- lm(y_CANGDP[5:samplesize]~cbind(x_CANGDP[4:(samplesize-1),],x_CANGDP[3:(samplesize-2),],x_CANGDP[2:(samplesize-3),],x_CANGDP[1:(samplesize-4),])+0)
+reg_5lag <- lm(y_CANGDP[6:samplesize]~cbind(x_CANGDP[5:(samplesize-1),],x_CANGDP[4:(samplesize-2),],x_CANGDP[3:(samplesize-3),],x_CANGDP[2:(samplesize-4),],
+                                            x_CANGDP[1:(samplesize-5),])+0)
+print("adj R^2 1 lag prediction")
+summary(reg_1lag)$adj.r.squared
+print("adj R^2 2 lag prediction")
+summary(reg_2lag)$adj.r.squared
+print("adj R^2 3 lag prediction")
+summary(reg_3lag)$adj.r.squared
+print("adj R^2 4 lag prediction")
+summary(reg_4lag)$adj.r.squared
+print("adj R^2 5 lag prediction")
+summary(reg_5lag)$adj.r.squared
+
+plot(x = c(1,2,3,4,5), y = c(summary(reg_1lag)$adj.r.squared,summary(reg_2lag)$adj.r.squared,summary(reg_3lag)$adj.r.squared,summary(reg_4lag)$adj.r.squared,summary(reg_5lag)$adj.r.squared),xlab = "Number of lags",ylab = "Adj. R^2",type = "l")
+```
+
+The adjusted R^2 seems to be maximized and stabilized around 3 lags, so I'll use 3 lags for the prediction 
+
+
+
+
+
+Simulation 1 (Indirect approach)
+
+```{r}
+n_replications <- 20 #Number of replications for the monte carlo simulation
+Sample_size <- 100
+
+#Regression coefficents of the dependent variables against the features
+a_1 <- CANGDP_feat_reg_coeff[1];a_2 <- CANGDP_feat_reg_coeff[2];a_3 <- CANGDP_feat_reg_coeff[3];a_4<- CANGDP_feat_reg_coeff[4];a_5 <- CANGDP_feat_reg_coeff[5];a_6 <- CANGDP_feat_reg_coeff[6];a_7 <- CANGDP_feat_reg_coeff[7];a_8 <- CANGDP_feat_reg_coeff[8];a_9 <- CANGDP_feat_reg_coeff[9];a_10 <- CANGDP_feat_reg_coeff[10];a_11 <- CANGDP_feat_reg_coeff[11];a_12 <- CANGDP_feat_reg_coeff[12];a_13 <- CANGDP_feat_reg_coeff[13];
+
+
+# Covariance matrix of innovations
+covmatrix <- summary(var_x_CANGDP)$covres
+colnames(covmatrix)<-NULL; rownames(covmatrix)<- NULL;
+
+# Standard deviations for error terms
+sds = c(0.0005,0.001,0.002,0.005,0.007,0.01) 
+sds_names = c('sd = 0.0005','sd = 0.001', 'sd = 0.002', 'sd = 0.005', 'sd = 0.007', 'sd = 0.01')
+Result_tables <- vector(mode = "list", length(sds))
+for(i in 1:length(sds)){
+   Result_tables[[i]]<- factors <- dynfactoR::dfm(x_T_set,r=k,p=3)$twostep
+}
+
+#Correlation matrix ranges
+#corr_ranges <- list("corr1" =c(0.1,0.3), "corr2"= c(0.3,0.6), "corr3"=c(0.6,0.9), "corr4"= c(-0.3,-0.1), "corr5"= c(-0.6,-0.3), "corr6" = c(-0.9,-0.6), "corr7"= c(-0.3,0.3), "corr8"= c(-0.6,0.6), "corr9"= c(-0.9,0.9))
+#sigma_names = c("cov1 (0.1,0.6)", "cov2 (0.6,1.5)", "cov3 (1.5,4)", "cov4 (-0.6,-0.1)", "cov5 (-1.5,-0.6)", "cov6 (-4,-1.5)", "cov7 (-0.6,0.6)", "cov8 (-1.5,1.5)", "cov9 (-4,4)")
+
+#Coefficient matrix ranges
+coeff_ranges <- list("coeff1" =c(-0.1,0.1), "coeff2"= c(-0.2,0.2),"coeff3"= c(-0.3,0.3),"coeff4"= c(-0.4,0.4))
+coeff_names = c("coeff1 (-0.1,0.1)", "coeff2 (-0.2,0.2)","coeff3 (-0.3,0.3)","coeff4 (-0.4,0.4)")
+
+#useful libraries to do PCA
+   library(devtools)
+   library(mvtnorm)
+   library(vctrs)
+   library(ggplot2)
+   library(factoextra)
+   library(tidyselect)
+
+#nowcasting library
+   library(nowcasting)
+
+for (j in 1:6)  #iterates over each standard deviation
+   {
+   options(error = traceback) #to catch eventual errors
+   
+   # To store the adjusted R^2's
+   adj_r2s_DFM <- matrix(0,12,4)
+   adj_r2s_pca <- matrix(0,12,4)
+   #adj_r2s_TS <- matrix(0,12,4)
+   
+   # To store the mean squared errors
+   #mses_2s <- matrix(0,12,4)
+   #mses_pca <- matrix(0,12,4)
+   #mses_TS <- matrix(0,12,4)
+   
+   # To store the ratios
+   ratio_2s_to_pca <- matrix(0,12,4)
+   #ratio_2s_to_TS <-  matrix(0,12,4)
+   #var_ratio_2s_to_pca <- matrix(0,12,4)
+   #var_ratio_2s_to_TS <-  matrix(0,12,4)
+   
+   # To store the residual variances
+   #res_vars_2s <- matrix(0,12,4)
+   #res_vars_pca <- matrix(0,12,4)
+   #res_vars_TS <- matrix(0,12,4)
+   
+   
+   for (i in 1:4)  #iterates over each range of coefficient
+   #for (i in 1:9)  #iterates over each range of correlation matrix
+      {
+      options(error = traceback) #to catch eventual errors
+      
+      
+      for(R in 1:n_replications) #For each replication
+         {
+          
+         
+         
+         options(error = traceback) #to catch eventual errors
+         
+         DFMerror <- TRUE
+         while(DFMerror){
+         
+            DFMerror <- FALSE
+         
+         #### generate coefficient matrix
+         coeff_range <- coeff_ranges[[i]]
+         coeff_val = round(runif(169, min = coeff_range[1], max = coeff_range[2]),4)
+         coeff <- matrix(coeff_val,13,13)
+      
+         #### generate correlation matrix
+         #corr_range<- corr_ranges[[i]] #range of the correlations
+         #n = runif(169, min = corr_range[1], max =corr_range[2]) #generating the correlations
+         # creating the matrix
+         #corrmatrix <- matrix(n,13,13)
+         # making it symmetric
+         #ind <- lower.tri(corrmatrix) 
+         #corrmatrix[ind] <- t(corrmatrix)[ind] 
+         #diag(corrmatrix) <- 1
+         # making the matrix positive definite
+         #corrmatrix <- nearPD(corrmatrix, corr = TRUE)
+         #corrmatrix <- corrmatrix$mat
+         
+         #### generate the series
+         sim <- VARMAsim(180,arlags = 1,phi=coeff,sigma=covmatrix)
+         TS_1 <- as.ts(sim$series[,1])
+         TS_2 <- as.ts(sim$series[,2])
+         TS_3 <- as.ts(sim$series[,3])
+         TS_4 <- as.ts(sim$series[,4])
+         TS_5 <- as.ts(sim$series[,5])
+         TS_6 <- as.ts(sim$series[,6])
+         TS_7 <- as.ts(sim$series[,7])
+         TS_8 <- as.ts(sim$series[,8])
+         TS_9 <- as.ts(sim$series[,9])
+         TS_10 <- as.ts(sim$series[,10])
+         TS_11 <- as.ts(sim$series[,11])
+         TS_12 <- as.ts(sim$series[,12])
+         TS_13 <- as.ts(sim$series[,13])
+         
+         #### generate error term
+         normerror=rnorm(length(TS_1), sd = sds[j])
+         
+         #### Generating the dependent variable
+         Y = a_1*TS_1 + a_2*TS_2 + a_3*TS_3 + a_4*TS_4 + a_5*TS_5 + a_6*TS_6 + a_7*TS_7 + a_8*TS_8 + a_9*TS_9 +a_10*TS_10+a_11*TS_11+a_12*TS_12+a_13*TS_13 + normerror
+        
+   
+         TS = matrix(c(TS_1, TS_2, TS_3, TS_4, TS_5, TS_6, TS_7, TS_8, TS_9,TS_10,TS_11,TS_12,TS_13), ncol = 13)
+         
+         
+          #### Try DFM and redo the simulation in case of error
+          DFMs <- vector(mode = "list", length = 12)
+          tryCatch( { 
+          
+             for (k in 1:12){
+                #print(k)
+             
+                DFMs[[k]] <- dynfactoR::dfm(TS,r=k,p=1)
+                
+                }
+             }, error = function(e) {DFMerror <<- TRUE})
+         }
+         
+          ###################################################################
+          #### Time series regression
+          #TS_reg <- lm(Y~TS)
+          #Adjusted R^2
+          #adj_r2_TS<- summary(TS_reg)$adj.r.squared
+          #adj_r2s_TS[,i] <- adj_r2s_TS[,i] + rep(adj_r2_TS,12)
+          
+          #Variance of the residuals as a measure of estimation robustness
+          #res_var_TS <-var(TS_res)
+          #res_vars_TS[,i]<-res_vars_TS[,i]+ rep(res_var_TS,12)
+          
+          #Residuals standard error
+          #res_std_err_TS <- sqrt(sum(residuals(TS_reg)^2) / df.residual(TS_reg))
+          #res_std_errs_TS[,i]<-res_std_errs_TS[,i]+ rep(res_std_err_TS,12)
+          
+          #TS_res <- TS_reg$residuals
+          #mse_TS <- sum((TS_res)^2)/length(TS_res)
+          #mses_TS[,i] <- mses_TS[,i] + rep(mse_TS,12)
+          #res_var_TS <-var(TS_res)
+          #res_vars_TS[,i]<-res_vars_TS[,i]+ rep(res_var_TS,12) #variance of residuals
+          
+          
+          
+         
+          
+         #PCA
+         results.pca <- prcomp(TS, center=TRUE, scale = TRUE) #Doing PCA on the dependent variables TS
+         pcs = results.pca$x #storing the principal components
+         
+         
+         
+         
+         for (k in 1:12) #iterate over the number of factors/principal components
+         {  
+            
+            
+            
+           ###################################################################
+           #### Dynamic Factor Model
+           
+           options(error = traceback)
+           DFM <- DFMs[[k]]
+           DFM_reg <- lm(Y~DFM$twostep)
+           #Adjusted R^2
+           adj_r2_DFM<- summary(DFM_reg)$adj.r.squared
+           adj_r2s_DFM[k,i] = adj_r2s_DFM[k,i]+ adj_r2_DFM
+          
+           
+           
+           #DFM <- dynfactoR::dfm(TS,r=k,p=1) #performing DFM
+           #DFM_reg <- lm(Y~DFM$twostep) #regressing Y against the factors
+           #DFM_res <- DFM_reg$residuals
+           #mse_DFM <- sum((DFM_res)^2)/length(DFM_res)
+           #mses_2s[k,i] = mses_2s[k,i]+ mse_DFM
+           #res_var_2s <- var(DFM_res)
+           #res_vars_2s[k,i] <- res_vars_2s[k,i] + res_var_2s #variance of residuals
+            
+           ###################################################################
+           #### Principal component analysis
+           pca_reg <- lm(Y~pcs[,1:k])
+           #Adjusted R^2
+           adj_r2_pca<- summary(pca_reg)$adj.r.squared
+           adj_r2s_pca[k,i] = adj_r2s_pca[k,i]+ adj_r2_pca
+           
+            
+           #regression using the first k principal components
+           #pca_reg <- lm(Y~pcs[,1:k])
+           #pca_res = pca_reg$residuals
+           #mse_pca <- sum((pca_res)^2)/length(pca_res)
+           #mses_pca[k,i] <- mses_pca[k,i]+mse_pca
+           #res_var_pca <- var(pca_res)
+           #res_vars_pca[k,i] <- res_vars_pca[k,i] + res_var_pca #variance of residuals
+           
+           #print(adj_r2_DFM/adj_r2_pca)
+           #print(adj_r2_DFM/adj_r2_TS)
+           
+           
+           ### Ratios
+           
+           #Ratio of adjusted of R^2
+           ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (adj_r2_DFM/adj_r2_pca)
+           #ratio_2s_to_TS[k,i] = ratio_2s_to_TS[k,i] + (adj_r2_DFM/adj_r2_TS)
+           
+           
+           ##Ratio of MSEs
+           #ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (mse_DFM/mse_pca)
+           #ratio_2s_to_TS[k,i] = ratio_2s_to_TS[k,i] + (mse_DFM/mse_TS)
+           
+           ##Ratio of residual variances
+           #var_ratio_2s_to_pca[k,i] = var_ratio_2s_to_pca[k,i] + (res_var_2s/res_var_pca)
+           #var_ratio_2s_to_TS[k,i] = var_ratio_2s_to_TS[k,i] + (res_var_2s/res_var_TS)
+           
+           
+           
+           
+         }
+         
+         
+         
+ 
+         
+         ###################################################################
+         #### Dynamic Factor Model
+         
+         #data_SIM <- cbind(Y,TS)
+         
+         #data_SIM <- window(data_SIM, start = time(data_SIM)[1], end = time(data_SIM)[nrow(data_SIM)])
+         #data_SIM <- Bpanel(base = data_SIM, trans = rep(0,ncol(data_SIM)))
+         #colnames(data_SIM)[1] <- paste("Y")
+         
+         ## Performing nowcasting on the training set
+         #frequency_SIM <- rep(as.integer(12),ncol(data_SIM))
+         #frequency_SIM <- c(12, rep(12, ncol(data_SIM)-1))
+         
+         #for (k in 1:12)
+          #{
+           # print(k)
+          #Performs the nowcasting for k factors
+          #now2s_SIM <- nowcast(formula = Y ~ ., data = data_SIM, r = k, p   = 1, q = k, method = '2s', frequency = frequency_SIM)
+          
+          #DFM <- dynfactoR::dfm(TS,r=k,p=1) #performing DFM
+          #DFM_reg <- lm(Y~DFM$twostep) #regressing Y against the factors
+          #DFM_res <- DFM_reg$residuals
+          #mse_DFM <- sum((DFM_res)^2)/length(DFM_res)
+          #mses_2s[k,i] = mses_2s[k,i]+ mse_DFM
+          
+          #ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (mses_2s[k,i]/mses_pca[k,i])
+          
+          #res_var_2s[k,i] <- res_var_2s[k,i] + var(A_2s_SIM) #variance of residuals
+          
+
+          #M=length(now2s_SIM$yfcst[,1])
+          #M <- Sample_size
+          
+          #Residuals
+          #A_2s_SIM=now2s_SIM$yfcst[,1]-now2s_SIM$yfcst[,2]  
+          #A_2s_SIM=unclass(A_2s_SIM) # change 'Time Series' into a vector
+          #A_2s_SIM=na.omit(A_2s_SIM) # get rid of 'NA'
+          #A_2s_SIM <- TS
+
+          #mse_2s=sum(A_2s_SIM^2)/M #factor model square error
+          
+          
+          #}
+        
+         
+         
+         
+         
+         
+         
+         ###################################################################
+         #### Time series regression
+         #TS_reg <- lm(Y~TS)
+         
+         #TS_res <- TS_reg$residuals
+         #mse_TS <- sum((TS_res)^2)/length(TS_res)
+         #mses_TS[,i] <- mses_TS[,i] + rep(mse_TS,12)
+         #ratio_2s_to_TS[,i] = ratio_2s_to_TS[,i] + (mses_2s[,i]/mses_TS[,i])
+         
+         #res_var_TS[,i]<-rep(var(TS_res),12) #variance of residuals
+         
+      }
+      
+      #Average over all replications
+      adj_r2s_DFM[,i] <- (1/n_replications)*adj_r2s_DFM[,i]
+      adj_r2s_pca[,i] <- (1/n_replications)*adj_r2s_pca[,i]
+      #adj_r2s_TS[,i] <- (1/n_replications)*adj_r2s_TS[,i]
+      ratio_2s_to_pca[,i] <- (1/n_replications)*ratio_2s_to_pca[,i]
+      #ratio_2s_to_TS[,i] <-  (1/n_replications)*ratio_2s_to_TS[,i]
+      #print(ratio_2s_to_pca[,i])
+      #print(ratio_2s_to_TS[,i])
+      
+      #mses_2s <- (1/n_replications)*mses_2s
+      #mses_pca <- (1/n_replications)*mses_pca
+      #mses_TS <- (1/n_replications)*mses_TS
+      #ratio_2s_to_pca <- (1/n_replications)*ratio_2s_to_pca
+      #ratio_2s_to_TS <-  (1/n_replications)*ratio_2s_to_TS
+      #res_vars_2s <- (1/n_replications)*res_vars_2s
+      #res_vars_pca <- (1/n_replications)*res_vars_pca
+      #res_vars_TS <- (1/n_replications)*res_vars_TS
+      #var_ratio_2s_to_pca <- (1/n_replications)*var_ratio_2s_to_pca
+      #var_ratio_2s_to_TS <-  (1/n_replications)*var_ratio_2s_to_TS
+      
+     
+      }
+   
+  
+   
+   
+   ################################################################
+   ####Printing the results for this standard deviation
+
+   print(sds_names[j])
+   
+   # Storing the average ratios of DFM's R^2 to PCA's R^2 in a table
+   blankline = rep("",4)
+   datamatrix = rbind(blankline,ratio_2s_to_pca,blankline)
+   #colnames(datamatrix) <- sigma_names
+   colnames(datamatrix) <- coeff_names
+   PClist = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix) <- c("Adj_R^2_DFM/Adj_R^2_PCA",PClist,"")
+   datatable = as.table(datamatrix)
+   Result_tables[[j]][[1]] <- datatable
+   print(datatable)
+   
+   
+   # Storing the average adjusted R^2 for DFM in a table
+   blankline = rep("",4)
+   datamatrix = rbind(blankline,adj_r2s_DFM,blankline)
+   #colnames(datamatrix) <- sigma_names
+   colnames(datamatrix) <- coeff_names
+   PClist = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix) <- c("Adj_R^2_DFM",PClist,"")
+   datatable = as.table(datamatrix)
+   Result_tables[[j]][[2]] <- datatable
+   print(datatable)
+   
+   
+
+
+}
+
+
+
+```
+
+
+
+Displaying the results for each standard deviation
+
+a) Ratio of Adj R^2's
+```{r}
+for(i in 1:6) #For each error standard deviation
+{
+   print(sds_names[i])
+   print(Result_tables[[i]][[1]])
+   
+}
+
+```
+
+
+b) Adj R^2
+
+```{r}
+for(i in 1:6) #For each error standard deviation
+{
+   print(sds_names[i])
+   print(Result_tables[[i]][[2]])
+   
+}
+```
+
+Displaying the results for each coefficient matrix range
+
+a) Ratio of Adj R^2's
+
+
+```{r}
+
+for(i in 1:4) #for each coefficient matirx
+{
+   print(coeff_names[i])
+   blankline1 = rep("",6)
+   ratio_2s_to_pca1 <- matrix(0,12,6)
+   for(j in 1:6) #for each standard deviation
+      { 
+      ratio_2s_to_pca1[,j]<- as.vector(Result_tables[[j]][[1]][2:13,i])
+   }
+   datamatrix1 = rbind(blankline1,ratio_2s_to_pca1,blankline1)
+   colnames(datamatrix1) <- sds_names
+   PClist1 = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix1) <- c("Adj_R^2_DFM/Adj_R^2_PCA",PClist1,"")
+   datatable1 = as.table(datamatrix1)
+   print(datatable1)
+   
+}
+
+
+
+
+   
+```
+
+
+
+
+b) Adj R^2
+
+```{r}
+for(i in 1:4) #for each coefficient matirx
+{
+   print(coeff_names[i])
+   blankline1 = rep("",6)
+   adj_r2s_DFM1 <- matrix(0,12,6)
+   for(j in 1:6) #for each standard deviation
+      { 
+      adj_r2s_DFM1[,j]<- as.vector(Result_tables[[j]][[2]][2:13,i])
+   }
+   datamatrix1 = rbind(blankline1,adj_r2s_DFM1,blankline1)
+   colnames(datamatrix1) <- sds_names
+   PClist1 = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix1) <- c("Adj_R^2_DFM",PClist1,"")
+   datatable1 = as.table(datamatrix1)
+   print(datatable1)
+   
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+reg_3lag <- lm(y_CANGDP[4:samplesize]~cbind(x_CANGDP[3:(samplesize-1),],x_CANGDP[2:(samplesize-2),],x_CANGDP[1:(samplesize-3),])+0)
+lag_reg_coeff <- as.vector(reg_3lag$coefficients)
+lag_reg_coeff <- matrix(lag_reg_coeff,ncol = 1)
+lag_reg_coeff
+
+```
+
+```{r}
+qqnorm(reg_3lag$residuals)
+qqline(reg_3lag$residuals, col = "steelblue", lwd = 2)
+print("p-value of Shapiro Wilk test")
+print(shapiro.test(reg_3lag$residuals)$p.value)
+print("standard deviation of the residuals")
+sd(reg_3lag$residuals)
+hist(reg_3lag$residuals)
+```
+
+
+The residuals are slightly, left skewed. For simplicity and for the sake of this simulation, I'll just assume they're normal.
+
+
+
+
+
+
+
+
+Simulation 2 (direct approach)
+
+```{r}
+n_replications <- 20 #Number of replications for the monte carlo simulation
+Sample_size <- 100
+
+#Regression coefficents of the dependent variables against the features
+#a_1 <- CANGDP_feat_reg_coeff[1];a_2 <- CANGDP_feat_reg_coeff[2];a_3 <- CANGDP_feat_reg_coeff[3];a_4<- CANGDP_feat_reg_coeff[4];a_5 <- CANGDP_feat_reg_coeff[5];a_6 <- CANGDP_feat_reg_coeff[6];a_7 <- CANGDP_feat_reg_coeff[7];a_8 <- CANGDP_feat_reg_coeff[8];a_9 <- CANGDP_feat_reg_coeff[9];a_10 <- CANGDP_feat_reg_coeff[10];a_11 <- CANGDP_feat_reg_coeff[11];a_12 <- CANGDP_feat_reg_coeff[12];a_13 <- CANGDP_feat_reg_coeff[13];
+
+
+# Covariance matrix of innovations
+covmatrix <- summary(var_x_CANGDP)$covres
+colnames(covmatrix)<-NULL; rownames(covmatrix)<- NULL;
+
+# Standard deviations for error terms
+sds = c(0.0005,0.001,0.002,0.005,0.007,0.01) 
+sds_names = c('sd = 0.0005','sd = 0.001', 'sd = 0.002', 'sd = 0.005', 'sd = 0.007', 'sd = 0.01')
+Result_tables2 <- vector(mode = "list", length(sds))
+for(i in 1:length(sds)){
+   Result_tables[[i]]<- vector(mode = "list", 2)
+}
+
+#Correlation matrix ranges
+#corr_ranges <- list("corr1" =c(0.1,0.3), "corr2"= c(0.3,0.6), "corr3"=c(0.6,0.9), "corr4"= c(-0.3,-0.1), "corr5"= c(-0.6,-0.3), "corr6" = c(-0.9,-0.6), "corr7"= c(-0.3,0.3), "corr8"= c(-0.6,0.6), "corr9"= c(-0.9,0.9))
+#sigma_names = c("cov1 (0.1,0.6)", "cov2 (0.6,1.5)", "cov3 (1.5,4)", "cov4 (-0.6,-0.1)", "cov5 (-1.5,-0.6)", "cov6 (-4,-1.5)", "cov7 (-0.6,0.6)", "cov8 (-1.5,1.5)", "cov9 (-4,4)")
+
+#Coefficient matrix ranges
+coeff_ranges <- list("coeff1" =c(-0.1,0.1), "coeff2"= c(-0.2,0.2),"coeff3"= c(-0.3,0.3),"coeff4"= c(-0.4,0.4))
+coeff_names = c("coeff1 (-0.1,0.1)", "coeff2 (-0.2,0.2)","coeff3 (-0.3,0.3)","coeff4 (-0.4,0.4)")
+
+#useful libraries to do PCA
+   library(devtools)
+   library(mvtnorm)
+   library(vctrs)
+   library(ggplot2)
+   library(factoextra)
+   library(tidyselect)
+
+#nowcasting library
+   library(nowcasting)
+
+for (j in 1:6)  #iterates over each standard deviation
+   {
+   options(error = traceback) #to catch eventual errors
+   
+   # To store the adjusted R^2's
+   adj_r2s_DFM <- matrix(0,12,4)
+   adj_r2s_pca <- matrix(0,12,4)
+   #adj_r2s_TS <- matrix(0,12,4)
+   
+   # To store the mean squared errors
+   #mses_2s <- matrix(0,12,4)
+   #mses_pca <- matrix(0,12,4)
+   #mses_TS <- matrix(0,12,4)
+   
+   # To store the ratios
+   ratio_2s_to_pca <- matrix(0,12,4)
+   #ratio_2s_to_TS <-  matrix(0,12,4)
+   #var_ratio_2s_to_pca <- matrix(0,12,4)
+   #var_ratio_2s_to_TS <-  matrix(0,12,4)
+   
+   # To store the residual variances
+   #res_vars_2s <- matrix(0,12,4)
+   #res_vars_pca <- matrix(0,12,4)
+   #res_vars_TS <- matrix(0,12,4)
+   
+   
+   for (i in 1:4)  #iterates over each range of coefficient
+   #for (i in 1:9)  #iterates over each range of correlation matrix
+      {
+      options(error = traceback) #to catch eventual errors
+      
+      
+      for(R in 1:n_replications) #For each replication
+         {
+          
+         
+         
+         options(error = traceback) #to catch eventual errors
+         
+         DFMerror <- TRUE
+         while(DFMerror){
+         
+            DFMerror <- FALSE
+         
+         #### generate coefficient matrix
+         coeff_range <- coeff_ranges[[i]]
+         coeff_val = round(runif(169, min = coeff_range[1], max = coeff_range[2]),4)
+         coeff <- matrix(coeff_val,13,13)
+      
+         #### generate correlation matrix
+         #corr_range<- corr_ranges[[i]] #range of the correlations
+         #n = runif(169, min = corr_range[1], max =corr_range[2]) #generating the correlations
+         # creating the matrix
+         #corrmatrix <- matrix(n,13,13)
+         # making it symmetric
+         #ind <- lower.tri(corrmatrix) 
+         #corrmatrix[ind] <- t(corrmatrix)[ind] 
+         #diag(corrmatrix) <- 1
+         # making the matrix positive definite
+         #corrmatrix <- nearPD(corrmatrix, corr = TRUE)
+         #corrmatrix <- corrmatrix$mat
+         
+         #### generate the series
+         sim <- VARMAsim(180,arlags = 1,phi=coeff,sigma=covmatrix)
+         TS_1 <- as.ts(sim$series[,1])
+         TS_2 <- as.ts(sim$series[,2])
+         TS_3 <- as.ts(sim$series[,3])
+         TS_4 <- as.ts(sim$series[,4])
+         TS_5 <- as.ts(sim$series[,5])
+         TS_6 <- as.ts(sim$series[,6])
+         TS_7 <- as.ts(sim$series[,7])
+         TS_8 <- as.ts(sim$series[,8])
+         TS_9 <- as.ts(sim$series[,9])
+         TS_10 <- as.ts(sim$series[,10])
+         TS_11 <- as.ts(sim$series[,11])
+         TS_12 <- as.ts(sim$series[,12])
+         TS_13 <- as.ts(sim$series[,13])
+         
+         TS = matrix(c(TS_1, TS_2, TS_3, TS_4, TS_5, TS_6, TS_7, TS_8, TS_9,TS_10,TS_11,TS_12,TS_13), ncol = 13)
+         
+         #### generate error term
+         normerror=rnorm(177, sd = sds[j])
+         
+         #### Generating the dependent variable
+         Y = cbind(TS[3:179,],TS[2:178,],TS[1:177,]) %*% lag_reg_coeff  + matrix(normerror,ncol = 1)
+         
+        
+   
+         
+         
+          #### Try DFM and redo the simulation in case of error
+          DFMs <- vector(mode = "list", length = 12)
+          tryCatch( { 
+          
+             for (k in 1:12){
+                #print(k)
+             
+                DFMs[[k]] <- dynfactoR::dfm(TS,r=k,p=1)
+                
+                }
+             }, error = function(e) {DFMerror <<- TRUE})
+         }
+         
+          ###################################################################
+          #### Time series regression
+          #TS_reg <- lm(Y~TS)
+          #Adjusted R^2
+          #adj_r2_TS<- summary(TS_reg)$adj.r.squared
+          #adj_r2s_TS[,i] <- adj_r2s_TS[,i] + rep(adj_r2_TS,12)
+          
+          #Variance of the residuals as a measure of estimation robustness
+          #res_var_TS <-var(TS_res)
+          #res_vars_TS[,i]<-res_vars_TS[,i]+ rep(res_var_TS,12)
+          
+          #Residuals standard error
+          #res_std_err_TS <- sqrt(sum(residuals(TS_reg)^2) / df.residual(TS_reg))
+          #res_std_errs_TS[,i]<-res_std_errs_TS[,i]+ rep(res_std_err_TS,12)
+          
+          #TS_res <- TS_reg$residuals
+          #mse_TS <- sum((TS_res)^2)/length(TS_res)
+          #mses_TS[,i] <- mses_TS[,i] + rep(mse_TS,12)
+          #res_var_TS <-var(TS_res)
+          #res_vars_TS[,i]<-res_vars_TS[,i]+ rep(res_var_TS,12) #variance of residuals
+          
+          
+          
+         
+          
+         #PCA
+         results.pca <- prcomp(TS, center=TRUE, scale = TRUE) #Doing PCA on the dependent variables TS
+         pcs = results.pca$x #storing the principal components
+         
+         
+         
+         
+         for (k in 1:12) #iterate over the number of factors/principal components
+         {  
+            
+            
+            
+           ###################################################################
+           #### Dynamic Factor Model
+           
+           options(error = traceback)
+           DFM <- DFMs[[k]]
+           DFM_reg <- lm(Y~cbind(DFM$twostep[3:179,],DFM$twostep[2:178,],DFM$twostep[1:177,]))
+           #Adjusted R^2
+           adj_r2_DFM<- summary(DFM_reg)$adj.r.squared
+           adj_r2s_DFM[k,i] = adj_r2s_DFM[k,i]+ adj_r2_DFM
+          
+           
+           
+           #DFM <- dynfactoR::dfm(TS,r=k,p=1) #performing DFM
+           #DFM_reg <- lm(Y~DFM$twostep) #regressing Y against the factors
+           #DFM_res <- DFM_reg$residuals
+           #mse_DFM <- sum((DFM_res)^2)/length(DFM_res)
+           #mses_2s[k,i] = mses_2s[k,i]+ mse_DFM
+           #res_var_2s <- var(DFM_res)
+           #res_vars_2s[k,i] <- res_vars_2s[k,i] + res_var_2s #variance of residuals
+            
+           ###################################################################
+           #### Principal component analysis
+           pca_reg <- lm(Y~cbind(pcs[3:179,1:k],pcs[2:178,1:k],pcs[1:177,1:k]) )      
+           #Adjusted R^2
+           adj_r2_pca<- summary(pca_reg)$adj.r.squared
+           adj_r2s_pca[k,i] = adj_r2s_pca[k,i]+ adj_r2_pca
+           
+            
+           #regression using the first k principal components
+           #pca_reg <- lm(Y~pcs[,1:k])
+           #pca_res = pca_reg$residuals
+           #mse_pca <- sum((pca_res)^2)/length(pca_res)
+           #mses_pca[k,i] <- mses_pca[k,i]+mse_pca
+           #res_var_pca <- var(pca_res)
+           #res_vars_pca[k,i] <- res_vars_pca[k,i] + res_var_pca #variance of residuals
+           
+           #print(adj_r2_DFM/adj_r2_pca)
+           #print(adj_r2_DFM/adj_r2_TS)
+           
+           
+           ### Ratios
+           
+           #Ratio of adjusted of R^2
+           ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (adj_r2_DFM/adj_r2_pca)
+           #ratio_2s_to_TS[k,i] = ratio_2s_to_TS[k,i] + (adj_r2_DFM/adj_r2_TS)
+           
+           
+           ##Ratio of MSEs
+           #ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (mse_DFM/mse_pca)
+           #ratio_2s_to_TS[k,i] = ratio_2s_to_TS[k,i] + (mse_DFM/mse_TS)
+           
+           ##Ratio of residual variances
+           #var_ratio_2s_to_pca[k,i] = var_ratio_2s_to_pca[k,i] + (res_var_2s/res_var_pca)
+           #var_ratio_2s_to_TS[k,i] = var_ratio_2s_to_TS[k,i] + (res_var_2s/res_var_TS)
+           
+           
+           
+           
+         }
+         
+         
+         
+ 
+         
+         ###################################################################
+         #### Dynamic Factor Model
+         
+         #data_SIM <- cbind(Y,TS)
+         
+         #data_SIM <- window(data_SIM, start = time(data_SIM)[1], end = time(data_SIM)[nrow(data_SIM)])
+         #data_SIM <- Bpanel(base = data_SIM, trans = rep(0,ncol(data_SIM)))
+         #colnames(data_SIM)[1] <- paste("Y")
+         
+         ## Performing nowcasting on the training set
+         #frequency_SIM <- rep(as.integer(12),ncol(data_SIM))
+         #frequency_SIM <- c(12, rep(12, ncol(data_SIM)-1))
+         
+         #for (k in 1:12)
+          #{
+           # print(k)
+          #Performs the nowcasting for k factors
+          #now2s_SIM <- nowcast(formula = Y ~ ., data = data_SIM, r = k, p   = 1, q = k, method = '2s', frequency = frequency_SIM)
+          
+          #DFM <- dynfactoR::dfm(TS,r=k,p=1) #performing DFM
+          #DFM_reg <- lm(Y~DFM$twostep) #regressing Y against the factors
+          #DFM_res <- DFM_reg$residuals
+          #mse_DFM <- sum((DFM_res)^2)/length(DFM_res)
+          #mses_2s[k,i] = mses_2s[k,i]+ mse_DFM
+          
+          #ratio_2s_to_pca[k,i] = ratio_2s_to_pca[k,i] + (mses_2s[k,i]/mses_pca[k,i])
+          
+          #res_var_2s[k,i] <- res_var_2s[k,i] + var(A_2s_SIM) #variance of residuals
+          
+
+          #M=length(now2s_SIM$yfcst[,1])
+          #M <- Sample_size
+          
+          #Residuals
+          #A_2s_SIM=now2s_SIM$yfcst[,1]-now2s_SIM$yfcst[,2]  
+          #A_2s_SIM=unclass(A_2s_SIM) # change 'Time Series' into a vector
+          #A_2s_SIM=na.omit(A_2s_SIM) # get rid of 'NA'
+          #A_2s_SIM <- TS
+
+          #mse_2s=sum(A_2s_SIM^2)/M #factor model square error
+          
+          
+          #}
+        
+         
+         
+         
+         
+         
+         
+         ###################################################################
+         #### Time series regression
+         #TS_reg <- lm(Y~TS)
+         
+         #TS_res <- TS_reg$residuals
+         #mse_TS <- sum((TS_res)^2)/length(TS_res)
+         #mses_TS[,i] <- mses_TS[,i] + rep(mse_TS,12)
+         #ratio_2s_to_TS[,i] = ratio_2s_to_TS[,i] + (mses_2s[,i]/mses_TS[,i])
+         
+         #res_var_TS[,i]<-rep(var(TS_res),12) #variance of residuals
+         
+      }
+      
+      #Average over all replications
+      adj_r2s_DFM[,i] <- (1/n_replications)*adj_r2s_DFM[,i]
+      adj_r2s_pca[,i] <- (1/n_replications)*adj_r2s_pca[,i]
+      #adj_r2s_TS[,i] <- (1/n_replications)*adj_r2s_TS[,i]
+      ratio_2s_to_pca[,i] <- (1/n_replications)*ratio_2s_to_pca[,i]
+      #ratio_2s_to_TS[,i] <-  (1/n_replications)*ratio_2s_to_TS[,i]
+      #print(ratio_2s_to_pca[,i])
+      #print(ratio_2s_to_TS[,i])
+      
+      #mses_2s <- (1/n_replications)*mses_2s
+      #mses_pca <- (1/n_replications)*mses_pca
+      #mses_TS <- (1/n_replications)*mses_TS
+      #ratio_2s_to_pca <- (1/n_replications)*ratio_2s_to_pca
+      #ratio_2s_to_TS <-  (1/n_replications)*ratio_2s_to_TS
+      #res_vars_2s <- (1/n_replications)*res_vars_2s
+      #res_vars_pca <- (1/n_replications)*res_vars_pca
+      #res_vars_TS <- (1/n_replications)*res_vars_TS
+      #var_ratio_2s_to_pca <- (1/n_replications)*var_ratio_2s_to_pca
+      #var_ratio_2s_to_TS <-  (1/n_replications)*var_ratio_2s_to_TS
+      
+     
+      }
+   
+  
+   
+   
+   ################################################################
+   ####Printing the results for this standard deviation
+
+   print(sds_names[j])
+   
+   # Storing the average ratios of DFM's R^2 to PCA's R^2 in a table
+   blankline = rep("",4)
+   datamatrix = rbind(blankline,ratio_2s_to_pca,blankline)
+   #colnames(datamatrix) <- sigma_names
+   colnames(datamatrix) <- coeff_names
+   PClist = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix) <- c("Adj_R^2_DFM/Adj_R^2_PCA",PClist,"")
+   datatable = as.table(datamatrix)
+   Result_tables2[[j]][[1]] <- datatable
+   print(datatable)
+   
+   
+   # Storing the average adjusted R^2 for DFM in a table
+   blankline = rep("",4)
+   datamatrix = rbind(blankline,adj_r2s_DFM,blankline)
+   #colnames(datamatrix) <- sigma_names
+   colnames(datamatrix) <- coeff_names
+   PClist = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix) <- c("Adj_R^2_DFM",PClist,"")
+   datatable = as.table(datamatrix)
+   Result_tables2[[j]][[2]] <- datatable
+   print(datatable)
+   
+   
+
+
+}
+
+
+
+```
+
+
+
+
+Displaying the results for each standard deviation
+
+a) Ratio of Adj R^2's
+```{r}
+for(i in 1:6) #For each error standard deviation
+{
+   print(sds_names[i])
+   print(Result_tables2[[i]][[1]])
+   
+}
+
+```
+
+
+
+
+b) Adj R^2
+
+```{r}
+for(i in 1:6) #For each error standard deviation
+{
+   print(sds_names[i])
+   print(Result_tables2[[i]][[2]])
+   
+}
+
+
+```
+
+
+
+Displaying the results for each coefficient matrix range
+
+a) Ratio of Adj R^2's
+
+
+```{r}
+
+for(i in 1:4) #for each coefficient matirx
+{
+   print(coeff_names[i])
+   blankline1 = rep("",6)
+   ratio_2s_to_pca1 <- matrix(0,12,6)
+   for(j in 1:6) #for each standard deviation
+      { 
+      ratio_2s_to_pca1[,j]<- as.vector(Result_tables2[[j]][[1]][2:13,i])
+   }
+   datamatrix1 = rbind(blankline1,ratio_2s_to_pca1,blankline1)
+   colnames(datamatrix1) <- sds_names
+   PClist1 = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix1) <- c("Adj_R^2_DFM/Adj_R^2_PCA",PClist1,"")
+   datatable1 = as.table(datamatrix1)
+   print(datatable1)
+   
+}
+
+
+
+
+   
+```
+
+
+
+b) Adj R^2
+
+```{r}
+for(i in 1:4) #for each coefficient matirx
+{
+   print(coeff_names[i])
+   blankline1 = rep("",6)
+   adj_r2s_DFM1 <- matrix(0,12,6)
+   for(j in 1:6) #for each standard deviation
+      { 
+      adj_r2s_DFM1[,j]<- as.vector(Result_tables2[[j]][[2]][2:13,i])
+   }
+   datamatrix1 = rbind(blankline1,adj_r2s_DFM1,blankline1)
+   colnames(datamatrix1) <- sds_names
+   PClist1 = c("1 PC/factor", "2 PCs/factors", "3 PCs/factors", "4 PCs/factors", "5 PCs/factors", "6 PCs/factors", "7 PCs/factors", "8 PCs/factors", "9 PCs/factors", "10 PCs/factors", "11 PCs/factors", "12 PCs/factors")
+   rownames(datamatrix1) <- c("Adj_R^2_DFM",PClist1,"")
+   datatable1 = as.table(datamatrix1)
+   print(datatable1)
+   
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

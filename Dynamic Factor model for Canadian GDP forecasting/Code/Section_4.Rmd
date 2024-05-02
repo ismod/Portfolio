@@ -1,0 +1,1115 @@
+---
+title: "Nowcast_Predict_CANGDP"
+output: word_document
+---
+
+Data preparation step
+
+```{r}
+#### Loading the data 
+STATCAN_data<-read.table("statcan.txt") # make sure statcan.txt is in your working directory
+m <- ncol(STATCAN_data)
+STATCAN_data <- STATCAN_data[,2:m] #The first column contains the dates, so it's not important 
+STATCAN_names <-c("Y1_HOURS","X1_HOURSMAN","X2_HOURSWSRT","Y2_CPI","Y3_EMP","Y4_USCAN","Y5_ROWCAN","Y6_CANUS","Y7_CANROW","Y8_RAIL","Y9_DOM","Y10_TRAN","Y11_INT","Y12_MSM","Y13_MRTS","Y14_IMP","Y15_EXP","Y16_GDP")
+colnames(STATCAN_data) <- STATCAN_names
+str(STATCAN_data) # check the type of object - at this moment this is 'data.frame', we need 'Time Series'
+```
+
+
+```{r}
+#### Removing the time series with strong seasonality
+toremove=c(which(colnames(STATCAN_data) == "Y3_EMP"),which(colnames(STATCAN_data) == "Y9_DOM"),which(colnames(STATCAN_data) == "Y10_TRAN"),which(colnames(STATCAN_data) == "Y11_INT"))
+STATCAN_data <- subset(STATCAN_data, select=-toremove)
+
+```
+
+```{r}
+#### Converting the dataframe object to a time series object (monthly data)
+STATCAN_ts<-ts(STATCAN_data,frequency=12, class = c("ts")) 
+```
+
+
+
+```{r}
+#### Making the time series stationary
+
+
+#Now the time series will be transformed to make them stationary. To achieve that, I'll difference them once (i.e Yt will be replaced by Yt-Yt-1).
+#For this I use the Bpanel(base,trans,....) function (in the nowcasting package). 
+#It's first argument "base" contains the time series to transform. 
+#The second argument indicates "trans" is a vector whose ith element indicates the transformation to do on the ith time series of "base". if this ith element is 2, then the ith time series will be differenced once.
+
+library(nowcasting)
+Transformations <- as.integer(rep(1,ncol(STATCAN_ts))) #vector of transformations for the Bpanel() function. the inner function returns something of type "num" and as.integer() converts it to something of type "int".
+STATCAN_ts.stat <- Bpanel(base = STATCAN_ts, trans = Transformations) #There are 12 NAs at the end of each time series. Those are used in the nowcasting function for the out of sample forecasts. The function will not work without them.
+
+```
+
+```{r}
+#Removing the means for each time series
+seriesmeans <- as.vector(colMeans(STATCAN_ts.stat[1:181,]))
+meansmatrix <- matrix(rep(seriesmeans,nrow(STATCAN_ts.stat)),nrow = nrow(STATCAN_ts.stat),byrow = TRUE)
+STATCAN_ts.stat <- STATCAN_ts.stat - meansmatrix
+```
+
+
+```{r}
+#### Storing the dependent variable (GDP) and the independent variables
+
+
+gdp_position_CANGDP <- which(colnames(STATCAN_ts.stat) == "Y16_GDP") # which column contains GDP;
+
+x_CANGDP <- STATCAN_ts.stat[,-gdp_position_CANGDP]
+y_CANGDP <- STATCAN_ts.stat[,gdp_position_CANGDP]
+
+data_CANGDP <- cbind(y_CANGDP, x_CANGDP) #I put the GDP as the first column. This formating is necessary for the nowcasting function to work. 
+
+#Removing the NAs for the PCA regression part
+x_CANGDP <- na.omit(x_CANGDP, na.action = "exclude" ) 
+y_CANGDP <- na.omit(y_CANGDP, na.action = "exclude")
+
+
+#data_CANGDP
+
+```
+
+```{r}
+#Checking that the series are stationary
+
+#for (i in 1:ncol(x_CANGDP))
+#{
+   #plot.ts(x_CANGDP[,i])
+#}
+
+#plot.ts(y_CANGDP)
+```
+
+
+
+
+```{r}
+## libraries for data visualization
+library(ggplot2)
+library(gridExtra)
+
+library(vars) #package for VAR
+```
+
+
+I) Prediction with the features X
+
+I.1) Undirect approach to forecasting
+
+First I need to select the number of lags to use for the vector autoregression of the features. Following the results from the document Nowcast_time_space_dependence.Rmd, I chose p =1.
+
+```{r}
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set, 30% of the data
+
+P_I_1a <-rep(0,nrow(t_set)) #vector that will contain the predictions
+
+
+
+ 
+for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+{
+   options(error = traceback) #to catch eventual errors
+      
+   ## Training set
+   T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+   colnames(T_set)[1] <- paste("y_T_set")
+      
+   ## Dependent variable (GDP) and features
+   y_T_set <-  T_set[,1]
+   x_T_set <- T_set[,-1]
+      
+   ## Estimating a VAR for the features
+   x_var <- VAR(x_T_set, p=1, type="none")
+   x_var_coeff <- Acoef(x_var)
+   b1 <- as.matrix(x_var_coeff[[1]]) #; b2 <- as.matrix(x_var_coeff[[2]]) #; b3 <- as.matrix(x_var_coeff[[3]]) 
+      
+   ## Predicting Xt+1 using Xt, Xt-1, and Xt-2
+   x_predict <- as.vector( b1 %*% as.matrix(x_T_set[t,])) #+ b2 %*% as.matrix(x_T_set[(t-1),])) #+ b3 %*% as.matrix(x_T_set[(t-2),]))
+      
+      
+   ## Regressing y against the features
+   reg_y_x <- lm(y_T_set~ x_T_set+0)
+   reg_y_x_coeff <- as.vector(reg_y_x$coefficients)
+      
+   ## Predicting y using the predicted value of x
+   y_predict <- sum(x_predict*reg_y_x_coeff)
+      
+   P_I_1a[(t-144)] <- y_predict #storing the prediction
+      
+      
+      
+      
+      
+   }
+   
+
+
+ts.plot(t_set[,"y_CANGDP"],P_I_1a, col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+
+
+#################################### 
+#### Measuring forecasting performance
+n = length(P_I_1a)
+Errors_I_1a <- as.vector(P_I_1a)-as.vector(t_set[,"y_CANGDP"])
+
+## RMSE (Root mean square error)
+RMSE_I_1a <- sqrt((1/n)*sum((as.vector(P_I_1a)-as.vector(t_set[,"y_CANGDP"]))^2))
+  
+
+## MAE (Mean absolute error)
+MAE_I_1a <- (1/n)*sum(abs(as.vector(P_I_1a)-as.vector(t_set[,"y_CANGDP"])))
+ 
+
+## MAPE (Mean absolute percentage error)
+MAPE_I_1a <- sum(abs((as.vector(P_I_1a)-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+ 
+#RMSE_I_1a
+#MAE_I_1a
+#MAPE_I_1a
+
+```
+
+
+
+
+I.2) Direct approach to forecasting
+
+```{r}
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set, 30% of the data
+
+P_I_2a <-rep(0,nrow(t_set)) #vector that will contain the predictions
+
+
+
+ 
+for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+{
+   options(error = traceback) #to catch eventual errors
+      
+   ## Training set
+   T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+   colnames(T_set)[1] <- paste("y_T_set")
+      
+   ## Dependent variable (GDP) and features
+   y_T_set <-  as.vector( T_set[,1])
+   x_T_set <- T_set[,-1]
+      
+   ## Regression of Yt against Xt-1, Xt-2 and Xt-3
+   predictors <- cbind(x_T_set[3:(t-1),], x_T_set[2:(t-2),],x_T_set[1:(t-3),])
+   reg_y_x <- lm(y_T_set[4:t] ~ predictors+0)
+   reg_y_x_coeff <- as.vector(reg_y_x$coefficients)
+   
+   ## predicting Yt+1 using Xt, Xt-1 and Xt-2
+   y_predict <- sum(reg_y_x_coeff * c(as.vector(x_T_set[t,]), as.vector(x_T_set[(t-1),]),as.vector(x_T_set[(t-2),])))
+   
+   
+   P_I_2a[(t-144)] <- y_predict #storing the prediction
+      
+      
+      
+      
+      
+   }
+   
+
+
+ts.plot(t_set[,"y_CANGDP"],P_I_2a, col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+
+
+#################################### 
+#### Measuring forecasting performance
+n = length(P_I_2a)
+Errors_I_2a <- as.vector(P_I_2a)-as.vector(t_set[,"y_CANGDP"])
+
+## RMSE (Root mean square error)
+RMSE_I_2a <- sqrt((1/n)*sum((as.vector(P_I_2a)-as.vector(t_set[,"y_CANGDP"]))^2))
+  
+
+## MAE (Mean absolute error)
+MAE_I_2a <- (1/n)*sum(abs(as.vector(P_I_2a)-as.vector(t_set[,"y_CANGDP"])))
+ 
+
+## MAPE (Mean absolute percentage error)
+#MAPE_I_2a <- sum(abs((as.vector(P_I_2a)-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+ 
+#RMSE_I_2a
+#MAE_I_2a
+#MAPE_I_2a
+ 
+```
+
+
+
+I.3) Best prediction
+```{r}
+
+par(mfrow = c(2,2))
+## RMSE
+RMSE_data <- data.frame(c("Indirect approach", "Direct approach"), c(RMSE_I_1a,RMSE_I_2a))
+colnames(RMSE_data) <- c("Method", "RMSE")
+p1  <-ggplot(data=RMSE_data, aes(x=Method, y=RMSE)) +
+  geom_bar(stat="identity", fill ="blue")
+
+## MAE
+MAE_data <- data.frame(c("Indirect approach", "Direct approach"), c(MAE_I_1a,MAE_I_2a))
+colnames(MAE_data) <- c("Method", "MAE")
+p2  <-ggplot(data=MAE_data, aes(x=Method, y=MAE)) +
+  geom_bar(stat="identity", fill ="blue")
+
+## forecast error variance
+Err_var_I_1a <- var(Errors_I_1a)
+Err_var_I_2a <- var(Errors_I_2a)
+Err_var_data <- data.frame(c("Indirect approach", "Direct approach"), c(Err_var_I_1a,Err_var_I_2a))
+colnames(Err_var_data) <- c("Method", "Error variance")
+p3 <-ggplot(data=Err_var_data, aes(x=Method, y=`Error variance`)) +
+  geom_bar(stat="identity", fill ="blue")
+
+
+
+
+
+# Plotting
+grid.arrange(p1,p2,p3,ncol = 2)
+
+print("variance forecasting error for indirect approach")
+var(Errors_I_1a)
+print("variance forecasting error for direct approach")
+var(Errors_I_2a)
+
+```
+
+Looking at the plots, forecasting indirectly has the best forecasting accuracy. This approach also gives a smaller variance for the error terms and is therefore a more robust approach.
+
+```{r}
+
+#Storing best forecast accuracies for each metric, corresponding forecast errors and error variances
+best_RMSE_I <- RMSE_I_1a
+best_MAE_I <- MAE_I_1a
+best_Errors_RMSE_I <- Errors_I_1a
+best_Errors_MAE_I <- Errors_I_1a
+best_err_var_RMSE_I <- var(Errors_I_1a)
+best_err_var_MAE_I <- var(Errors_I_1a)
+
+
+
+
+```
+
+
+
+II) Prediction using the dynamic factors 
+
+The number of factors range from 5 to 12. My goal was to reduce the running time.
+
+II.1) Indirect approach
+
+
+```{r}
+
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set 30% of the data
+
+P_II_1a <- matrix(rep(0,nrow(t_set)*8),nrow = 8, ncol = nrow(t_set)) #Matrix that will contain the predictions. each row represent a given value of r (number of factors)
+
+
+for(k in 5:12) #k is the number of factors
+   {  
+   for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+   {
+      
+      
+      
+      options(error = traceback) #to catch eventual errors
+      
+      ## Training set
+      T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+      colnames(T_set)[1] <- paste("y_T_set")
+      
+      ## Dependent variable (GDP) and features
+      y_T_set <- T_set[,1]
+      x_T_set <- T_set[,-1]
+      
+      
+      
+      #Fitting DFM to the training set
+      factors <- dynfactoR::dfm(x_T_set,r=k,p=1)$twostep
+    
+      
+      
+      ## Estimating a VAR on the factors
+      fact_var <- VAR(factors ,p=1,type="none")
+      fact_var_coeff <- Acoef(fact_var)
+      c1 <- as.matrix(fact_var_coeff[[1]])#; c2 <- as.matrix(fact_var_coeff[[2]]); c3 <- as.matrix(fact_var_coeff[[3]])
+      
+      ## Predicting the next factors using previous ones
+      fact_predict <- as.vector( c1 %*% as.matrix(factors[t,]))# + c2 %*% as.matrix(factors[(t-1),]) + c3 %*% as.matrix(factors[(t-2),]) )
+      
+      ## Regressing the dependent variable y against the factors
+      fact_reg <- lm(y_T_set~factors+0)
+      fact_reg_coeff <- as.vector(fact_reg$coefficients)
+      
+      ## Predicting y using the predicted principal components
+      y_predict <- sum(fact_predict*fact_reg_coeff)
+      
+      P_II_1a[(k-4),(t-144)] <- y_predict #storing the prediction
+      
+      
+      
+      
+      
+      
+   }
+   
+}
+
+ts.plot(t_set[,"y_CANGDP"],P_II_1a[7,], col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+#################################### 
+#### Measuring forecasting performance
+n = ncol(P_II_1a)
+
+Errors_II_1a <- P_II_1a-matrix(rep(as.vector(t_set[,"y_CANGDP"]),8),nrow = 8, byrow = TRUE)
+
+## RMSE (Root mean square error)
+RMSEs_II_1a <- rep(0,nrow(P_II_1a))
+for (i in 1:nrow(P_II_1a)) #For each value of r (starting art 5)
+{
+   RMSE <- sqrt((1/n)*sum((as.vector(P_II_1a[i,])-as.vector(t_set[,"y_CANGDP"]))^2))
+   RMSEs_II_1a[i] <- RMSE
+}
+
+## MAE (Mean absolute error)
+MAEs_II_1a <- rep(0,nrow(P_II_1a))
+for (i in 1:nrow(P_II_1a))  #For each value of r (starting art 5)
+{
+   
+   MAE <- (1/n)*sum(abs(as.vector(P_II_1a[i,])-as.vector(t_set[,"y_CANGDP"])))
+   MAEs_II_1a[i] <- MAE
+}
+
+## MAPE (Mean absolute percentage error)
+#MAPEs_II_1a <- rep(0,nrow(P_II_1a))
+#for (i in 1:nrow(P_II_1a))  #For each value of r (starting art 5)
+#{
+   #mape <- sum(abs((as.vector(P_II_1a[i,])-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+   #MAPEs_II_1a[i] <- mape
+#}
+
+## Variance of error for r =5,6,...,12
+Err_var_II_1a <- rep(0,nrow(P_II_1a))
+for (i in 1:nrow(P_II_1a))  #For each value of r (starting art 5)
+{
+   Error_variance <- var(Errors_II_1a[i,])
+   Err_var_II_1a[i] <- Error_variance
+   
+}
+
+
+```
+
+```{r}
+Errors_II_1a <- P_II_1a-matrix(rep(as.vector(t_set[,"y_CANGDP"]),8),nrow = 8, byrow = TRUE)
+Err_var_II_1a <- rep(0,nrow(P_II_1a))
+for (i in 1:nrow(P_II_1a))  #For each value of r (starting art 5)
+{
+   Error_variance <- var(Errors_II_1a[i,])
+   Err_var_II_1a[i] <- Error_variance
+   
+}
+Err_var_II_1a
+
+```
+
+
+
+
+II.2) Direct approach
+
+```{r}
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set 30% of the data
+
+P_II_2a <- matrix(rep(0,nrow(t_set)*8),nrow = 8, ncol = nrow(t_set)) #Matrix that will contain the predictions. each row represent a given value of r (number of factors)
+
+
+for(k in 5:12) #k is the number of factors
+   {  
+   print(k)
+   for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+   {
+      print(t)
+      
+      options(error = traceback) #to catch eventual errors
+      
+      ## Training set
+      T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+      colnames(T_set)[1] <- paste("y_T_set")
+      
+      ## Dependent variable (GDP) and features
+      y_T_set <- T_set[,1]
+      x_T_set <- T_set[,-1]
+      
+      
+      
+      #Fitting DFM to the training set
+      factors <- dynfactoR::dfm(x_T_set,r=k,p=3)$twostep
+      
+      predictors <- cbind(factors[3:(t-1),], factors[2:(t-2),],factors[1:(t-3),])
+      reg_y_factors <- lm(y_T_set[4:t] ~ predictors+0)
+      reg_y_factors_coeff <- as.vector(reg_y_factors$coefficients)
+   
+      ## predicting Yt+1 using Xt and Xt-1
+      y_predict <- sum(reg_y_factors_coeff * c(as.vector(factors[t,]), as.vector(factors[(t-1),]),as.vector(factors[(t-2),])))
+      
+      
+      P_II_2a[(k-4),(t-144)] <- y_predict #storing the prediction
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+
+      
+   }
+   
+}
+
+ts.plot(t_set[,"y_CANGDP"],P_II_2a[7,], col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+#################################### 
+#### Measuring forecasting performance
+n = ncol(P_II_2a)
+Errors_II_2a <- P_II_2a-matrix(rep(as.vector(t_set[,"y_CANGDP"]),8),nrow = 8, byrow = TRUE)
+
+## RMSE (Root mean square error)
+RMSEs_II_2a <- rep(0,nrow(P_II_2a))
+for (i in 1:nrow(P_II_2a)) #For each value of r (starting art 5)
+{
+   RMSE <- sqrt((1/n)*sum((as.vector(P_II_2a[i,])-as.vector(t_set[,"y_CANGDP"]))^2))
+   RMSEs_II_2a[i] <- RMSE
+}
+
+## MAE (Mean absolute error)
+MAEs_II_2a <- rep(0,nrow(P_II_2a))
+for (i in 1:nrow(P_II_2a))  #For each value of r (starting art 5)
+{
+   
+   MAE <- (1/n)*sum(abs(as.vector(P_II_2a[i,])-as.vector(t_set[,"y_CANGDP"])))
+   MAEs_II_2a[i] <- MAE
+}
+
+## MAPE (Mean absolute percentage error)
+#MAPEs_II_2a <- rep(0,nrow(P_II_2a))
+#for (i in 1:nrow(P_II_2a))  #For each value of r (starting art 5)
+#{
+   #mape <- sum(abs((as.vector(P_II_2a[i,])-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+   #MAPEs_II_2a[i] <- mape
+#}
+
+
+## Variance of error for r =5,6,...,12
+Err_var_II_2a <- rep(0,nrow(P_II_2a))
+for (i in 1:nrow(P_II_2a))  #For each value of r (starting art 5)
+{
+   Error_variance <- var(Errors_II_2a[i,])
+   Err_var_II_2a[i] <- Error_variance
+   
+}
+
+```
+
+
+
+
+```{r}
+#P_II_2a
+#mean(as.vector(Errors_II_2a[1,]))
+#var(as.vector(Errors_II_2a[1,]))
+#(1/n)*sum(as.vector(Errors_II_2a[1,])^2)
+#Err_var_II_2_a[1]
+#RMSEs_II_2a[1]
+
+```
+
+
+
+
+II.3) Best prediction
+
+```{r}
+
+options(error = traceback)
+
+## RMSE
+RMSE_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(RMSEs_II_1a,RMSEs_II_2a))
+colnames(RMSE_data) <- c("Method", "Number of factors", "RMSE")
+RMSE_data_plot <- ggplot(data=RMSE_data, aes(x=`Number of factors`, y=RMSE, group=Method)) +
+  geom_line(aes(color=Method))
+
+
+## MAE
+MAE_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(MAEs_II_1a,MAEs_II_2a))
+colnames(MAE_data) <- c("Method", "Number of factors", "MAE")
+MAE_data_plot <- ggplot(data=MAE_data, aes(x=`Number of factors`, y=MAE, group=Method)) +
+  geom_line(aes(color=Method))
+
+## MAPE
+#MAPE_data <- data.frame(c(rep("Undirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(MAPEs_II_1a,MAPEs_II_2a))
+#colnames(MAPE_data) <- c("Method", "Number of factors", "MAPE")
+#MAPE_data_plot <- ggplot(data=MAPE_data, aes(x=`Number of factors`, y=MAPE, group=Method)) +
+  #geom_line(aes(color=Method))
+
+
+## Error variance
+Errvar_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(Err_var_II_1a,Err_var_II_2a))
+colnames(Errvar_data) <- c("Method", "Number of factors", "Error variance")
+Errvar_data_plot <- ggplot(data=Errvar_data, aes(x=`Number of factors`, y=`Error variance`, group=Method)) +
+  geom_line(aes(color=Method))
+
+
+## Plotting
+#grid.arrange(RMSE_data_plot,MAE_data_plot,MAPE_data_plot,nrow = 2)
+grid.arrange(RMSE_data_plot, MAE_data_plot, Errvar_data_plot,nrow = 2)
+#RMSE_data_plot; MAE_data_plot; Errvar_data_plot
+
+```
+
+
+For the RMSE, The best forecasting accuracy is obtained using 9 factors and the direct approach. 
+For the MAE, The best forecasting accuracy is obtained using 8 factors and the direct approach.
+The forecast variances for both numbers of factors is relatively low
+
+
+
+```{r}
+#Storing best forecast accuracies for each metric, corresponding forecast errors and error variances
+best_RMSE_II <- RMSEs_II_2a[9-4]
+best_MAE_II <- MAEs_II_2a[8-4]
+best_Errors_RMSE_II <- Errors_II_2a[(9-4),]
+best_Errors_MAE_II <- Errors_II_2a[(8-4),]
+best_err_var_RMSE_II <- Err_var_II_2a[9-4]
+best_err_var_MAE_II <- Err_var_II_2a[8-4]
+```
+
+
+
+
+III) Prediction using the principal components
+
+III.1)Indirect approach
+
+The number of principal components range from 5 to 12. I wanted to reduce the running time.
+
+```{r}
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set
+
+P_III_1a <- matrix(rep(0,nrow(t_set)*8),nrow = 8, ncol = nrow(t_set)) #Matrix that will contain the predictions. each row represent a given value of r (number of factors)
+
+
+
+for(k in 5:12) #k is the number of principal components
+   {  
+   for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+   {
+      options(error = traceback) #to catch eventual errors
+      
+      ## Training set
+      T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+      colnames(T_set)[1] <- paste("y_T_set")
+      
+      ## Dependent variable (GDP) and features
+      y_T_set <- T_set[,1]
+      x_T_set <- T_set[,-1]
+      
+      ##Performing PCA on the training set 
+      results.pca <- prcomp(x_T_set, center=TRUE, scale = TRUE) 
+      pcs = results.pca$x[,1:k] #storing the k first principal components
+      
+      ## Estimating a VAR on the principal components
+      pcs_var <- VAR(pcs ,p=1,type="none")
+      pcs_var_coeff <- Acoef(pcs_var)
+      c1 <- as.matrix(pcs_var_coeff[[1]])#; c2 <- as.matrix(pcs_var_coeff[[2]]); c3 <- as.matrix(pcs_var_coeff[[3]])
+      
+      ## Predicting the next principal components using previous ones
+      pcs_predict <- as.vector( c1 %*% as.matrix(pcs[t,]))# + c2 %*% as.matrix(pcs[(t-1),]) + c3 %*% as.matrix(pcs[(t-2),]))
+      
+      ## Regressing the dependent variable y against the principal components
+      pca_reg <- lm(y_T_set~pcs+0)
+      pca_reg_coeff <- as.vector(pca_reg$coefficients)
+      
+      ## Predicting y using the predicted principal components
+      y_predict <- sum(pcs_predict*pca_reg_coeff)
+      
+      P_III_1a[(k-4),(t-144)] <- y_predict #storing the prediction
+      
+      
+   }
+   
+}
+
+ts.plot(t_set[,"y_CANGDP"],P_III_1a[7,], col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+#################################### 
+#### Measuring forecasting performance
+n = ncol(P_III_1a)
+Errors_III_1a <- P_III_1a-matrix(rep(as.vector(t_set[,"y_CANGDP"]),8),nrow = 8, byrow = TRUE)
+
+## RMSE (Root mean square error)
+RMSEs_III_1a <- rep(0,nrow(P_III_1a))
+for (i in 1:nrow(P_III_1a)) #For each value of r (starting art 5)
+{
+   RMSE <- sqrt((1/n)*sum((as.vector(P_III_1a[i,])-as.vector(t_set[,"y_CANGDP"]))^2))
+   RMSEs_III_1a[i] <- RMSE
+}
+
+## MAE (Mean absolute error)
+MAEs_III_1a <- rep(0,nrow(P_III_1a))
+for (i in 1:nrow(P_III_1a))  #For each value of r (starting art 5)
+{
+   
+   MAE <- (1/n)*sum(abs(as.vector(P_III_1a[i,])-as.vector(t_set[,"y_CANGDP"])))
+   MAEs_III_1a[i] <- MAE
+}
+
+## MAPE (Mean absolute percentage error)
+#MAPEs_III_1a <- rep(0,nrow(P_III_1a))
+#for (i in 1:nrow(P_III_1a))  #For each value of r (starting art 5)
+#{
+   #mape <- sum(abs((as.vector(P_III_1a[i,])-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+   #MAPEs_III_1a[i] <- mape
+#}
+
+
+
+## Variance of error for r =5,6,...,12
+Err_var_III_1a <- rep(0,nrow(P_III_1a))
+for (i in 1:nrow(P_III_1a))  #For each value of r (starting art 5)
+{
+   Error_variance <- var(Errors_III_1a[i,])
+   Err_var_III_1a[i] <- Error_variance
+   
+}
+```
+
+
+
+
+
+III.2) Direct approach
+
+
+```{r}
+t_set <- window(data_CANGDP, start = time(data_CANGDP)[146], end = time(data_CANGDP)[180]) #Testing set
+
+P_III_2a <- matrix(rep(0,nrow(t_set)*8),nrow = 8, ncol = nrow(t_set)) #Matrix that will contain the predictions. each row represent a given value of r (number of factors)
+
+
+
+for(k in 5:12) #k is the number of principal components
+   {  
+   for(t in 145:179) #t is the last index of the training set used for prediction. We want to predict Yt+1
+   {
+      options(error = traceback) #to catch eventual errors
+      
+      ## Training set
+      T_set <- window(data_CANGDP, start = time(data_CANGDP)[1], end = time(data_CANGDP)[t])
+      colnames(T_set)[1] <- paste("y_T_set")
+      
+      ## Dependent variable (GDP) and features
+      y_T_set <- T_set[,1]
+      x_T_set <- T_set[,-1]
+      
+      ##Performing PCA on the training set 
+      results.pca <- prcomp(x_T_set, center=TRUE, scale = TRUE) 
+      pcs = results.pca$x[,1:k] #storing the k first principal components
+      
+      ## Regressing Yt against PCt-1, PCt-2, PCt-3
+      predictors <- cbind(pcs[3:(t-1),], pcs[2:(t-2),],pcs[1:(t-3),] )
+      reg_y_pcs <- lm(y_T_set[4:t] ~ predictors+0)
+      reg_y_pcs_coeff <- as.vector(reg_y_pcs$coefficients)
+   
+      ## predicting Yt+1 using PCt, PCt-1 and PCt-2
+      y_predict <-  sum(reg_y_pcs_coeff * c(as.vector(pcs[t,]), as.vector(pcs[(t-1),]),as.vector(pcs[(t-2),]) ))
+      
+      
+      P_III_2a[(k-4),(t-144)] <- y_predict #storing the prediction
+      
+      
+   }
+   
+}
+
+ts.plot(t_set[,"y_CANGDP"],P_III_2a[7,], col = c("blue", "red"))
+legend("topright", c("Observed","Predicted"), fill=c("blue","red"))
+
+#################################### 
+#### Measuring forecasting performance
+n = ncol(P_III_2a)
+Errors_III_2a <- P_III_2a-matrix(rep(as.vector(t_set[,"y_CANGDP"]),8),nrow = 8, byrow = TRUE)
+
+
+## RMSE (Root mean square error)
+RMSEs_III_2a <- rep(0,nrow(P_III_2a))
+for (i in 1:nrow(P_III_2a)) #For each value of r (starting art 5)
+{
+   RMSE <- sqrt((1/n)*sum((as.vector(P_III_2a[i,])-as.vector(t_set[,"y_CANGDP"]))^2))
+   RMSEs_III_2a[i] <- RMSE
+}
+
+## MAE (Mean absolute error)
+MAEs_III_2a <- rep(0,nrow(P_III_2a))
+for (i in 1:nrow(P_III_2a))  #For each value of r (starting art 5)
+{
+   
+   MAE <- (1/n)*sum(abs(as.vector(P_III_2a[i,])-as.vector(t_set[,"y_CANGDP"])))
+   MAEs_III_2a[i] <- MAE
+}
+
+## MAPE (Mean absolute percentage error)
+#MAPEs_III_2a <- rep(0,nrow(P_III_2a))
+#for (i in 1:nrow(P_III_2a))  #For each value of r (starting art 5)
+#{
+   #mape <- sum(abs((as.vector(P_III_2a[i,])-as.vector(t_set[,"y_CANGDP"]))/as.vector(t_set[,"y_CANGDP"])))
+   #MAPEs_III_2a[i] <- mape
+#}
+
+## Variance of error for r =5,6,...,12
+Err_var_III_2a <- rep(0,nrow(P_III_2a))
+for (i in 1:nrow(P_III_2a))  #For each value of r (starting art 5)
+{
+   Error_variance <- var(Errors_III_2a[i,])
+   Err_var_III_2a[i] <- Error_variance
+   
+}
+
+
+```
+
+
+
+
+
+
+III.3) Best prediction
+```{r}
+options(error = traceback)
+
+## RMSE
+RMSE_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(RMSEs_III_1a,RMSEs_III_2a))
+colnames(RMSE_data) <- c("Method", "Number of principal components", "RMSE")
+RMSE_data_plot <- ggplot(data=RMSE_data, aes(x=`Number of principal components`, y=RMSE, group=Method)) +
+  geom_line(aes(color=Method))
+
+
+## MAE
+MAE_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(MAEs_III_1a,MAEs_III_2a))
+colnames(MAE_data) <- c("Method", "Number of principal components", "MAE")
+MAE_data_plot <- ggplot(data=MAE_data, aes(x=`Number of principal components`, y=MAE, group=Method)) +
+  geom_line(aes(color=Method))
+
+## MAPE
+#MAPE_data <- data.frame(c(rep("Undirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(MAPEs_III_1a,MAPEs_III_2a))
+#colnames(MAPE_data) <- c("Method", "Number of principal components", "MAPE")
+#MAPE_data_plot <- ggplot(data=MAPE_data, aes(x=`Number of principal components`, y=MAPE, group=Method)) +
+  #geom_line(aes(color=Method))
+
+## Error variance
+Errvar_data <- data.frame(c(rep("Indirect approach",8),rep("Direct approach",8)),c(5:12,5:12),c(Err_var_III_1a,Err_var_III_2a))
+colnames(Errvar_data) <- c("Method", "Number of factors", "Error variance")
+Errvar_data_plot <- ggplot(data=Errvar_data, aes(x=`Number of factors`, y=`Error variance`, group=Method)) +
+  geom_line(aes(color=Method))
+
+## Plotting
+#grid.arrange(RMSE_data_plot,MAE_data_plot,MAPE_data_plot,nrow = 2)
+grid.arrange(RMSE_data_plot, MAE_data_plot, Errvar_data_plot,nrow = 2)
+#RMSE_data_plot;MAE_data_plot; Errvar_data_plot
+```
+
+
+For the RMSE, The best forecasting accuracy is obtained using 8 factors and the indirect approach. 
+For the MAE, The best forecasting accuracy is obtained using 9 factors and the direct approach.
+The lowest variance for the forecast errors is obtained with 8 factors and using the direct approach.
+I'll select 9 factors and the direct approach as the best forecasting performance.
+
+
+```{r}
+#Storing best forecast accuracies for each metric, corresponding forecast errors and error variances
+best_RMSE_III <- RMSEs_III_1a[8-4]
+best_MAE_III <- MAEs_III_1a[9-4]
+#best_MAPE_III <- MAPEs_III_1a[8-4]
+#best_Errors_III <- Errors_III_1a[(9-4),]
+best_Errors_RMSE_III <- Errors_III_2a[(8-4),]
+best_Errors_MAE_III <- Errors_III_2a[(9-4),]
+#best_err_var_III <- Err_var_III_1a[9-4]
+best_err_var_RMSE_III <- Err_var_III_2a[8-4]
+best_err_var_MAE_III <- Err_var_III_2a[9-4]
+
+
+
+
+
+
+```
+
+IV) Comparing the best prediction performances 
+
+
+Now I compare the best prediction performances of the 3 models (TS regression, PCA and DFM ). I visualize the best RMSE and best MAE for each model as well as the corresponding error variances
+
+```{r}
+## RMSE
+RMSEs_data <- data.frame(c("Features", "DFM", "PCA"),c(best_RMSE_I,best_RMSE_II,best_RMSE_III))
+colnames(RMSEs_data) <- c("Method", "Best RMSE")
+RMSEs_data$Method <- factor(RMSEs_data$Method, levels = c("Features", "DFM", "PCA")) #For the bars to be ordered this way
+p1  <-ggplot(data=RMSEs_data, aes(x=Method, y=RMSE, fill = Method)) +
+  geom_bar(stat="identity") + scale_fill_manual("Method", values = c("Features" = "darkslategray4", "DFM" = "darkslategray3", "PCA" = "darkslategray2"))
+
+
+## MAE
+MAEs_data <- data.frame(c("Features", "DFM", "PCA"),c(best_MAE_I,best_MAE_II,best_MAE_III))
+colnames(MAEs_data) <- c("Method", "Best MAE")
+
+MAEs_data$Method <- factor(MAEs_data$Method, levels = c("Features", "DFM", "PCA")) #For the bars to be ordered this way
+p2  <-ggplot(data=MAEs_data, aes(x=Method, y=MAE, fill = Method)) +
+  geom_bar(stat="identity") + scale_fill_manual("Method", values = c("Features" = "darkslategray4", "DFM" = "darkslategray3", "PCA" = "darkslategray2"))
+
+
+
+## Error variance for best RMSEs
+Errvars_data <- data.frame(c("Features", "DFM", "PCA"),c(best_err_var_RMSE_I,best_err_var_RMSE_II,best_err_var_RMSE_III))
+colnames(Errvars_data) <- c("Method", "Error variance best RMSE")
+
+Errvars_data$Method <- factor(Errvars_data$Method, levels = c("Features", "DFM", "PCA")) #For the bars to be ordered this way
+p3  <-ggplot(data=Errvars_data, aes(x=Method, y=`Error variance best RMSE`, fill = Method)) +
+  geom_bar(stat="identity") + scale_fill_manual("Method", values = c("Features" = "darkslategray4", "DFM" = "darkslategray3", "PCA" = "darkslategray2"))
+
+
+## Error variance for best MAEs
+## Error variance for best RMSEs
+Errvars_data <- data.frame(c("Features", "DFM", "PCA"),c(best_err_var_MAE_I,best_err_var_MAE_II,best_err_var_MAE_III))
+colnames(Errvars_data) <- c("Method", "Error variance best MAE")
+
+Errvars_data$Method <- factor(Errvars_data$Method, levels = c("Features", "DFM", "PCA")) #For the bars to be ordered this way
+p4  <-ggplot(data=Errvars_data, aes(x=Method, y=`Error variance best MAE`, fill = Method)) +
+  geom_bar(stat="identity") + scale_fill_manual("Method", values = c("Features" = "darkslategray4", "DFM" = "darkslategray3", "PCA" = "darkslategray2"))
+
+
+grid.arrange(p1,p2,p3,p4,nrow = 2)
+
+print("RMSE")
+print(paste0("Features: ", best_RMSE_I))
+print(paste0("DFM: ", best_RMSE_II))
+print(paste0("PCA: ", best_RMSE_III))
+
+print("MAE")
+print(paste0("Features: ", best_MAE_I))
+print(paste0("DFM: ", best_MAE_II))
+print(paste0("PCA: ", best_MAE_III))
+
+
+print("Error variance best RMSE")
+print(paste0("Features: ", best_err_var_RMSE_I))
+print(paste0("DFM: ", best_err_var_RMSE_II))
+print(paste0("PCA: ", best_err_var_RMSE_III))
+
+print("Error variance best MAE")
+print(paste0("Features: ", best_err_var_MAE_I))
+print(paste0("DFM: ", best_err_var_MAE_II))
+print(paste0("PCA: ", best_err_var_MAE_III))
+
+#print("MAPE")
+#print(paste0("Features: ", best_MAPE_I))
+#print(paste0("DFM: ", best_MAPE_II))
+#print(paste0("PCA: ", best_MAPE_III))
+```
+
+
+The results for the 3 methods look very similar. I'll do further test to determine if the differences are significant.
+
+
+
+V) Evaluating significance of the differences
+
+Now we'll evaluate the significance of the differences in the previous part. First we'll test the significance of the differences in squared error and absolute error. Next we'll test the significance of the differences in the forecast error variances.
+
+V.1) Differences in squared and absolute error
+
+
+
+For this part, we'll use the Harvey, Leybourne and Newbold (HLN) test.
+
+
+
+a) Test on squared errors
+
+```{r}
+# Checking the assumptions
+
+par(mfrow = c(2,2))
+
+plot.ts(best_Errors_RMSE_I^2-best_Errors_RMSE_II^2, ylab = "d_t", main = "DFM vs TS regression")
+lines(rep(mean(best_Errors_RMSE_I^2-best_Errors_RMSE_II^2),length(best_Errors_RMSE_I)),col = "red")
+
+plot.ts(best_Errors_RMSE_II^2-best_Errors_RMSE_III^2, ylab = "d_t", main = "DFM vs PCA")
+lines(rep(mean(best_Errors_RMSE_II^2-best_Errors_RMSE_III^2),length(best_Errors_RMSE_II)),col = "red")
+
+acf(best_Errors_RMSE_I^2-best_Errors_RMSE_II^2, ylab = "ACF d_t", main = "")
+acf(best_Errors_RMSE_II^2-best_Errors_RMSE_III^2, ylab = "ACF d_t", main = "")
+```
+
+Looking at the plots, its is reasonable to assume that the loss differentials form a stationary process and that the autocorrelation at lag 1 is 0
+
+```{r}
+dm.test(best_Errors_RMSE_I,best_Errors_RMSE_II,alternative = "two.sided",h=1,power=2)
+```
+
+The p value is very high, therefore we do not reject the null hypthesis which states the expected difference of squared prediction error between TS regression and DFM is 0.
+
+```{r}
+dm.test(best_Errors_RMSE_II,best_Errors_RMSE_III,alternative = "two.sided",h=1,power=2)
+```
+
+The p value is very high, therefore we do not reject the null hypthesis which states the expected difference of squared prediction error between PCA and DFM is 0.
+
+
+
+
+b) Test on absolute errors
+
+```{r}
+# Checking the assumptions
+
+par(mfrow = c(2,2))
+
+plot.ts(abs(best_Errors_MAE_I)-abs(best_Errors_MAE_II), ylab = "d_t", main = "DFM vs TS regression")
+lines(rep(mean(abs(best_Errors_MAE_I)-abs(best_Errors_MAE_II)),length(best_Errors_MAE_I)),col = "red")
+
+plot.ts(abs(best_Errors_MAE_II)-abs(best_Errors_MAE_III), ylab = "d_t", main = "DFM vs PCA")
+lines(rep(mean(abs(best_Errors_MAE_II)-abs(best_Errors_MAE_III)),length(best_Errors_MAE_II)),col = "red")
+
+acf(abs(best_Errors_MAE_I)-abs(best_Errors_MAE_II), ylab = "ACF d_t", main = "")
+acf(abs(best_Errors_MAE_II)-abs(best_Errors_MAE_III), ylab = "ACF d_t", main = "")
+```
+
+Looking at the plots, its is reasonable to assume that the loss differentials form a stationary process and that the autocorrelation at lag 1 is 0
+
+
+```{r}
+dm.test(best_Errors_MAE_I,best_Errors_MAE_II,alternative = "two.sided",h=1,power=1)
+```
+
+The p value is very high, therefore we do not reject the null hypthesis which states the expected difference of absolute prediction error between TS regression and DFM is 0.
+
+```{r}
+dm.test(best_Errors_MAE_II,best_Errors_MAE_III,alternative = "two.sided",h=1,power=1)
+```
+
+The p value is very high, therefore we do not reject the null hypthesis which states the expected difference of absolute prediction error between PCA and DFM is 0.
+
+
+
+
+
+V.2 Difference in variance of forecast errors
+
+Checking normality of forecast errors
+
+forecast errors corresponding to best RMSEs
+
+```{r}
+par(mfrow = c(2,2))
+#hist(best_Errors_RMSE_I)
+#hist(best_Errors_RMSE_II)
+#hist(best_Errors_RMSE_III)
+
+qqnorm(best_Errors_RMSE_I,main = "TS regression")
+qqline(best_Errors_RMSE_I, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_RMSE_I)
+
+qqnorm(best_Errors_RMSE_II, main = "DFM")
+qqline(best_Errors_RMSE_II, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_RMSE_II)
+
+qqnorm(best_Errors_RMSE_III, main = "PCA")
+qqline(best_Errors_RMSE_III, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_RMSE_III)
+```
+
+
+```{r}
+library(car)
+groups <- c(best_Errors_RMSE_I,best_Errors_RMSE_II,rep("group1",length(best_Errors_RMSE_I)),rep("group2",length(best_Errors_RMSE_II)))
+groups <- matrix(groups,ncol = 2,byrow = FALSE)
+groups <- as.data.frame(groups)
+leveneTest(as.numeric(V1)~V2,data = groups)
+
+groups <- c(best_Errors_RMSE_II,best_Errors_RMSE_III,rep("group1",length(best_Errors_RMSE_II)),rep("group2",length(best_Errors_RMSE_III)))
+groups <- matrix(groups,ncol = 2,byrow = FALSE)
+groups <- as.data.frame(groups)
+leveneTest(as.numeric(V1)~V2,data = groups)
+#levene.test(c(best_Errors_RMSE_I,best_Errors_RMSE_II)~c(rep("group1",length(best_Errors_RMSE_I)),rep("group2",length(best_Errors_RMSE_II))))
+#levene.test(best_Errors_RMSE_II,best_Errors_RMSE_III)
+```
+
+
+
+
+forecast errors corresponding to best MAEs
+
+```{r}
+par(mfrow = c(2,2))
+#hist(best_Errors_RMSE_I)
+#hist(best_Errors_RMSE_II)
+#hist(best_Errors_RMSE_III)
+
+qqnorm(best_Errors_MAE_I,main = "TS regression")
+qqline(best_Errors_MAE_I, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_MAE_I)
+
+qqnorm(best_Errors_MAE_II, main = "DFM")
+qqline(best_Errors_MAE_II, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_MAE_II)
+
+qqnorm(best_Errors_MAE_III, main = "PCA")
+qqline(best_Errors_MAE_III, col = "steelblue", lwd = 2)
+shapiro.test(best_Errors_MAE_III)
+
+
+
+
+
+
+```
+
+
+```{r}
+library(car)
+groups <- c(best_Errors_MAE_I,best_Errors_MAE_II,rep("group1",length(best_Errors_MAE_I)),rep("group2",length(best_Errors_MAE_II)))
+groups <- matrix(groups,ncol = 2,byrow = FALSE)
+groups <- as.data.frame(groups)
+leveneTest(as.numeric(V1)~V2,data = groups)
+
+groups <- c(best_Errors_MAE_II,best_Errors_MAE_III,rep("group1",length(best_Errors_MAE_II)),rep("group2",length(best_Errors_MAE_III)))
+groups <- matrix(groups,ncol = 2,byrow = FALSE)
+groups <- as.data.frame(groups)
+leveneTest(as.numeric(V1)~V2,data = groups)
+```
+
+
+
+
+
